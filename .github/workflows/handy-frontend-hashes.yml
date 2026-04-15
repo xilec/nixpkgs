@@ -1,0 +1,123 @@
+# Helper workflow for the handy package: compute frontendDeps FOD hashes
+# across all four supported systems by forcing every entry of
+# `frontendDepsHashes` to `lib.fakeHash`, running the build, and parsing
+# the "got:" line from the nix error output.
+#
+# Runner → nix system mapping:
+#   ubuntu-latest    → x86_64-linux
+#   ubuntu-24.04-arm → aarch64-linux   (public GH-hosted ARM Linux runner)
+#   macos-13         → x86_64-darwin   (last Intel macOS runner image)
+#   macos-latest     → aarch64-darwin  (Apple Silicon)
+#
+# Trigger manually (workflow_dispatch) or by pushing to the handy branches
+# below. Each matrix job prints the computed hash to its job summary; copy
+# the value into `frontendDepsHashes` in
+# `pkgs/by-name/ha/handy/package.nix`.
+#
+# This workflow is an isolated helper and does not affect the rest of
+# nixpkgs CI. It can be removed before merging upstream if desired.
+
+name: handy frontend-deps hashes
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - handy-cross-platform-deps
+      - "handy/**"
+
+jobs:
+  hash:
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - ubuntu-24.04-arm
+          - macos-13
+          - macos-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install nix
+        uses: DeterminateSystems/nix-installer-action@main
+
+      - name: Force fakeHash in frontendDepsHashes
+        run: |
+          python3 <<'PY'
+          import pathlib, re
+          p = pathlib.Path("pkgs/by-name/ha/handy/package.nix")
+          text = p.read_text()
+          new_text, n = re.subn(
+              r'(frontendDepsHashes\s*=\s*\{[^}]*?\})',
+              lambda m: re.sub(r'"sha256-[^"]+="', 'lib.fakeHash', m.group(1)),
+              text,
+              flags=re.DOTALL,
+          )
+          if n != 1:
+              raise SystemExit(f"expected exactly one frontendDepsHashes block, found {n}")
+          p.write_text(new_text)
+          print("patched package.nix with fakeHash")
+          PY
+
+      - name: Build handy.passthru.frontendDeps and capture hash
+        run: |
+          set -o pipefail
+          system=$(nix eval --impure --raw --expr 'builtins.currentSystem')
+          out=$(nix-build -A handy.passthru.frontendDeps --no-out-link 2>&1 || true)
+          hash=$(printf '%s\n' "$out" | awk '/got:/{print $2; exit}')
+          if [[ -z "$hash" ]]; then
+            echo "::error::failed to parse hash from nix-build output"
+            printf '%s\n' "$out" | tail -60
+            exit 1
+          fi
+          {
+            printf '## %s\n\n' "$system"
+            printf '```nix\n'
+            printf '"%s" = "%s";\n' "$system" "$hash"
+            printf '```\n'
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "Result: $system → $hash"
+          printf 'system=%s\n' "$system" >> "$GITHUB_ENV"
+          printf 'hash=%s\n' "$hash" >> "$GITHUB_ENV"
+
+      - name: Rebuild with the correct hash for diagnostics
+        run: |
+          set -euo pipefail
+          python3 <<PY
+          import pathlib, re
+          p = pathlib.Path("pkgs/by-name/ha/handy/package.nix")
+          text = p.read_text()
+          text = text.replace('"${{ env.system }}" = lib.fakeHash;', '"${{ env.system }}" = "${{ env.hash }}";')
+          p.write_text(text)
+          PY
+          nix-build -A handy.passthru.frontendDeps --no-out-link -o result
+          store=$(readlink result || true)
+          if [[ -z "$store" ]]; then
+            store=$(nix-build -A handy.passthru.frontendDeps --no-out-link)
+          fi
+          echo "store=$store" >> "$GITHUB_ENV"
+
+      - name: Dump diagnostic listings
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/diag"
+          store="${{ env.store }}"
+          find "$store" -type l -path "*/node_modules/.bin/*" | sed "s|$store/||" | LC_ALL=C sort > "$RUNNER_TEMP/diag/bins.txt"
+          find "$store" -type l | sed "s|$store/||" | while read -r l; do
+            printf '%s -> %s\n' "$l" "$(readlink "$store/$l")"
+          done | LC_ALL=C sort > "$RUNNER_TEMP/diag/links.txt"
+          find "$store" -type f | sed "s|$store/||" | LC_ALL=C sort > "$RUNNER_TEMP/diag/files.txt"
+          {
+            printf '## %s counts\n\n' "${{ env.system }}"
+            printf 'bins:  %s\n' "$(wc -l < "$RUNNER_TEMP/diag/bins.txt")"
+            printf 'links: %s\n' "$(wc -l < "$RUNNER_TEMP/diag/links.txt")"
+            printf 'files: %s\n' "$(wc -l < "$RUNNER_TEMP/diag/files.txt")"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload diagnostics
+        uses: actions/upload-artifact@v4
+        with:
+          name: handy-diag-${{ env.system }}
+          path: ${{ runner.temp }}/diag/
