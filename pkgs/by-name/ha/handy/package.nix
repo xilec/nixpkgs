@@ -10,6 +10,7 @@
   cctools,
   cargo-tauri,
   jq,
+  nix-update-script,
   writableTmpDirAsHomeHook,
   makeBinaryWrapper,
   swift,
@@ -272,10 +273,22 @@ rustPlatform.buildRustPackage (
         "$out/Applications/Handy.app/Contents/MacOS/handy"
     '';
 
-    # Expose frontendDeps so it can be built directly (e.g. by the update
-    # script) without dragging in the full handy compile.
     passthru = {
+      # Expose frontendDeps so it can be built directly by the update
+      # script (or by hand) without dragging in the full handy compile.
       inherit frontendDeps;
+
+      # nix-update refreshes version + src + cargoHash on its own; the
+      # `--subpackage frontendDeps` flag tells it to also rebuild
+      # `handy.passthru.frontendDeps` and replace the entry in
+      # `frontendDepsHashes` matching the current host's system. Each
+      # target system needs a separate run on the appropriate host.
+      updateScript = nix-update-script {
+        extraArgs = [
+          "--subpackage"
+          "frontendDeps"
+        ];
+      };
     };
 
     meta = {
